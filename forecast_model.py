@@ -1,6 +1,7 @@
-from prophet import Prophet
+from statsforecast import StatsForecast
+from statsforecast.models import AutoETS
 import pandas as pd
-from datetime import datetime
+import os
 
 # --- Global caches ---
 MODEL_CACHE = {}
@@ -14,41 +15,64 @@ file_map = {
     "russell": "data/rut.csv"
 }
 
-# --- Preload and train models once ---
+# --- Load data and train models on import ---
 for index, path in file_map.items():
     try:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+        
+        # Load and clean data
         df = pd.read_csv(path)
         df.rename(columns={"Date": "ds", "Close/Last": "y"}, inplace=True)
-        df["ds"] = pd.to_datetime(df["ds"], errors='coerce')
+        df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
         df["y"] = df["y"].replace('[\$,]', '', regex=True).astype(float)
         df = df.dropna(subset=["ds", "y"]).drop_duplicates(subset="ds").sort_values("ds")
 
-        model = Prophet(daily_seasonality=True, yearly_seasonality=True)
-        model.fit(df)
+        # Add required column for StatsForecast
+        df["unique_id"] = index
 
-        MODEL_CACHE[index] = model
+        # Save data for later reference
         DATA_CACHE[index] = df
-        print(f"✅ Loaded and trained model for {index}")
+
+        # Train model
+        sf = StatsForecast(
+            models=[AutoETS(season_length=252, model="ZZZ")],  # 252 = trading days/year
+            freq="D",
+            n_jobs=1
+        )
+        sf.fit(df[["unique_id", "ds", "y"]])
+        MODEL_CACHE[index] = sf
+
+        print(f"✅ Loaded and trained StatsForecast model for {index}")
     except Exception as e:
         print(f"❌ Failed to load model for {index}: {e}")
 
-# --- Fast forecasting using cached models ---
+# --- Forecast function ---
 def load_and_forecast(index: str = "nasdaq", days: int = 365):
     if index not in MODEL_CACHE:
         return {"error": "Invalid index"}
 
-    model = MODEL_CACHE[index]
+    try:
+        sf = MODEL_CACHE[index]
+        df = DATA_CACHE[index]
 
-    # Predict future values
-    future = model.make_future_dataframe(periods=days)
-    forecast = model.predict(future)
+        # Predict future values
+        forecast_df = sf.predict(h=days)
+        forecast = forecast_df[forecast_df["unique_id"] == index].copy()
 
-    # Smooth forecast
-    future_range = forecast[['ds', 'yhat']].tail(days).copy()
-    future_range['yhat_smooth'] = future_range['yhat'].rolling(window=7, min_periods=1).mean()
+        # Smooth predictions using a 7-day rolling average
+        forecast["yhat_smooth"] = forecast["yhat"].rolling(window=7, min_periods=1).mean()
 
-    result = [
-        {"ds": row["ds"].strftime("%Y-%m-%d"), "yhat": round(row["yhat_smooth"], 2)}
-        for _, row in future_range.iterrows()
-    ]
-    return {"forecast": result}
+        # Format output
+        result = [
+            {
+                "ds": (df["ds"].max() + pd.Timedelta(days=i + 1)).strftime("%Y-%m-%d"),
+                "yhat": round(row["yhat_smooth"], 2)
+            }
+            for i, row in forecast.iterrows()
+        ]
+
+        return {"forecast": result}
+
+    except Exception as e:
+        return {"error": f"Forecasting failed: {str(e)}"}
